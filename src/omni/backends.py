@@ -1,5 +1,5 @@
 """
-llm_backends.py — local inference backends for the agent runtime
+backends.py — local inference backends for the agent runtime
 ================================================================
 
 Drop-in `ModelClient` implementations for **Ollama**, **LM Studio** and
@@ -47,7 +47,7 @@ prepend. See `local_inference.md` §4.
 
 Quick check against your own machine:
 
-    python3 llm_backends.py            # probes all three, prints capabilities
+    python -m omni.backends            # probes all three, prints capabilities
 """
 
 from __future__ import annotations

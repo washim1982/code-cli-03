@@ -1,5 +1,5 @@
 """
-agent_runtime.py — Autonomous developer-agent runtime (v2)
+runtime.py — Autonomous developer-agent runtime (v2)
 ==========================================================
 
 A hardened rewrite of the original `agent_system_scaffolding.py`.
@@ -33,8 +33,8 @@ full rationale):
  10. Budgets & timeouts  — iterations, wall clock, tokens and USD are all
                            enforced; every tool call has a timeout.
 
-Run the demo:      python3 agent_runtime.py
-Run the tests:     python3 -m pytest test_agent_runtime.py -q
+Run the demo:      python -m omni.runtime
+Run the tests:     python -m pytest -q
 """
 
 from __future__ import annotations
@@ -57,6 +57,44 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from omni import pathguard as jail
+
+
+def split_command(command: str) -> list[str]:
+    """
+    Tokenize a command string.
+
+    `posix=True` (the shlex default) treats backslash as an escape character,
+    which destroys every Windows path it touches:
+
+        C:\\Users\\wasim\\workspace  ->  ['C:Userswasimworkspace']
+
+    so the separators were gone before both the containment check and execution.
+    """
+    return shlex.split(command, posix=(os.name != "nt"))
+
+
+def approval_grants(decision: "PolicyDecision", approvals: Iterable[str]) -> bool:
+    """
+    True if `approvals` authorises this elevated command.
+
+    Accepts the legacy `"sudo"` token, the exact command string, or the bare
+    executable name. The loops previously tested `"sudo" not in approvals`,
+    while the CLI granted `[pending_command]` — so approving any elevated
+    non-sudo command (`rm`, `chmod`, `npm publish`, `git push`) never satisfied
+    the gate and the run re-suspended on the same command forever.
+    """
+    granted = {str(a).strip() for a in approvals if str(a).strip()}
+    if not granted:
+        return False
+    if "sudo" in granted:
+        return True
+    argv = list(decision.argv or [])
+    joined = " ".join(argv)
+    if joined and joined in granted:
+        return True
+    return bool(argv) and argv[0] in granted
 
 # =============================================================================
 # 0. Primitives
@@ -406,7 +444,17 @@ class CommandPolicy:
         "node": CommandRule("node"),
         "python": CommandRule("python"),
         "python3": CommandRule("python3"),
+        # `python` is what exists on Windows; SubprocessShell aliases between
+        # the two at execution time, but the policy is consulted first and must
+        # recognise both spellings or the verify command is refused.
+        "python": CommandRule("python"),
         "pytest": CommandRule("pytest"),
+        "ruff": CommandRule("ruff"),
+        "pip": CommandRule(
+            "pip",
+            allowed_subcommands=frozenset({"install", "list", "show", "freeze",
+                                           "check", "download"}),
+        ),
         "npx": CommandRule("npx"),
         "npm": CommandRule(
             "npm",
@@ -441,7 +489,7 @@ class CommandPolicy:
         violations = self._telemetry(command)
 
         try:
-            argv = shlex.split(command)
+            argv = split_command(command)
         except ValueError as exc:
             return PolicyDecision(Risk.FORBIDDEN, [], f"unparseable command: {exc}", violations)
         if not argv:
@@ -474,15 +522,27 @@ class CommandPolicy:
             if sub in rule.elevated_subcommands:
                 risk = Risk.ELEVATED
 
+        # Every non-flag token is treated as a candidate path. Ordinary words
+        # ("status", "hello") resolve inside the workspace and pass; only tokens
+        # that actually escape are refused. The previous version examined only
+        # tokens starting with "/" or containing "..", which meant a Windows
+        # drive-absolute path (C:/Users/...) was never checked at all.
         for token in argv[1:]:
             if token.startswith("-"):
                 continue
-            if token.startswith("/") or ".." in Path(token).parts:
-                resolved = (self.workspace / token).resolve()
-                if not str(resolved).startswith(str(self.workspace)):
-                    return PolicyDecision(Risk.FORBIDDEN, argv,
-                                          f"path '{token}' escapes the workspace root",
-                                          violations)
+            candidate = Path(token)
+            target = candidate if candidate.is_absolute() else (self.workspace / token)
+            try:
+                resolved = target.resolve()
+            except (OSError, ValueError):
+                return PolicyDecision(Risk.FORBIDDEN, argv,
+                                      f"path '{token}' cannot be resolved", violations)
+            # jail.contained compares with Path.is_relative_to under normcase;
+            # str.startswith let `<workspace>-evil` pass as contained.
+            if not jail.contained(resolved, self.workspace):
+                return PolicyDecision(Risk.FORBIDDEN, argv,
+                                      f"path '{token}' escapes the workspace root",
+                                      violations)
 
         reason = "allowed" if risk is Risk.SAFE else f"requires approval ({rule.note or 'elevated'})"
         return PolicyDecision(risk, argv, reason, violations)
@@ -552,6 +612,74 @@ def finalize_output(raw: str) -> tuple[str, bool, tuple[str, ...]]:
     return f"{head}\n... [{elided} chars elided] ...\n{tail}", True, tuple(hits)
 
 
+SHELL_TOOLS = ("shell", "run_command")
+
+# Ollama reports `done_reason`, OpenAI-compatible servers `finish_reason`; both
+# use "length" when generation stopped at the token cap. This is a different
+# signal from `Completion.truncation_suspected`, which means the *prompt* was
+# truncated — checking that one does not detect a cut-off reply.
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+
+
+def output_truncated(completion: Any) -> bool:
+    """True if generation stopped because it hit the token cap."""
+    reason = str(getattr(completion, "finish_reason", "") or "").lower()
+    return reason in _TRUNCATED_FINISH_REASONS
+
+# Tools shipped as importable modules whose console-script executable is often
+# absent from PATH. `python -m <name>` is the portable spelling.
+_PYTHON_MODULE_SCRIPTS = frozenset({"pytest", "pip", "ruff", "compileall"})
+
+
+def describe_call(call: "ToolCall") -> str:
+    """
+    Short, stable rendering of a call, for journals, console lines, and the
+    `pending_command` of an approval suspension.
+
+    For a shell call this is exactly the command string, so journals and the
+    CLI's approval prompt read the same as they did when shell was the only
+    tool.
+    """
+    if call.tool in SHELL_TOOLS:
+        return str(call.args.get("command", ""))
+    parts = []
+    for key, value in call.args.items():
+        if key == "argv":
+            continue
+        # repr, not str-then-repr: the latter quoted everything, so an integer
+        # argument read back as `offset='74'` and looked like a type error that
+        # was not there.
+        text = repr(value)
+        if len(text) > 62:
+            text = text[:59] + "..."
+        parts.append(f"{key}={text}")
+    return f"{call.tool}({', '.join(parts)})"
+
+
+def classify_call(call: "ToolCall", command_policy: "CommandPolicy",
+                  tool_policy: Any = None) -> tuple[str, "PolicyDecision", bool]:
+    """
+    Decide whether a call may proceed. Returns `(label, verdict, is_shell)`.
+
+    `tool_policy` is an optional callable — in practice
+    `agentkit.ToolRegistry.policy_for` — that classifies non-shell tool calls.
+    Returning None from it defers to `CommandPolicy`, which is what keeps the
+    entire existing perimeter in force for shell commands: allowlist,
+    metacharacter ban, argv parsing, and workspace containment.
+
+    Filesystem tools deliberately do not pass through `CommandPolicy`. They are
+    not shell strings, so the metacharacter ban is meaningless for them, and
+    `omni.pathguard` is the correct control. Without this split the agent cannot
+    write a file at all: redirection is banned and `echo` cannot create one.
+    """
+    if tool_policy is not None and call.tool not in SHELL_TOOLS:
+        verdict = tool_policy(call)
+        if verdict is not None:
+            return describe_call(call), verdict, False
+    command = str(call.args.get("command", ""))
+    return command, command_policy.classify(command), True
+
+
 class ToolExecutor(Protocol):
     async def execute(self, call: ToolCall, timeout_s: float) -> ToolResult: ...
 
@@ -589,7 +717,7 @@ class SimulatedShell:
         )
 
     def _simulate(self, command: str) -> tuple[int, str]:
-        argv = shlex.split(command) if command else []
+        argv = split_command(command) if command else []
         elevated = bool(argv) and argv[0] == "sudo"
         if elevated:
             argv = argv[1:]
@@ -644,9 +772,31 @@ class SubprocessShell:
     policy layer bans metacharacters rather than trying to escape them.
     """
 
-    def __init__(self, workspace: Path, env: dict[str, str] | None = None) -> None:
+    #: Inherited from the parent process. Everything else is dropped, so tokens
+    #: and API keys sitting in the operator's shell are not handed to whatever
+    #: the agent decides to run. Add to this list deliberately, not by default.
+    ENV_ALLOWLIST = (
+        "PATH", "PATHEXT", "SYSTEMROOT", "WINDIR", "COMSPEC",
+        "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+        "LANG", "LC_ALL", "TZ", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+        "PYTHONIOENCODING", "PYTHONUTF8", "SYSTEMDRIVE",
+        # Python resolves its per-user site-packages through APPDATA on Windows
+        # (%APPDATA%\Python\PythonXY\site-packages). Dropping it makes every
+        # `pip install --user` package invisible to child processes — including
+        # pytest, which is the command the verification gate runs. These are
+        # directory paths, not credentials.
+        "APPDATA", "LOCALAPPDATA", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+    )
+
+    def __init__(self, workspace: Path, env: dict[str, str] | None = None,
+                 inherit_full_env: bool = False) -> None:
         self.workspace = workspace
-        base_env = os.environ.copy()
+        if inherit_full_env:
+            base_env = os.environ.copy()
+        else:
+            base_env = {k: v for k, v in os.environ.items()
+                        if k.upper() in self.ENV_ALLOWLIST}
+            base_env.setdefault("PYTHONIOENCODING", "utf-8")
         if env:
             base_env.update(env)
         self.env = base_env
@@ -655,7 +805,7 @@ class SubprocessShell:
         if "argv" in call.args:
             argv = list(call.args["argv"])
         elif "command" in call.args:
-            argv = shlex.split(str(call.args["command"]))
+            argv = split_command(str(call.args["command"]))
         else:
             argv = []
         started = now_ms()
@@ -673,6 +823,30 @@ class SubprocessShell:
         elif head == "python" and shutil.which("python") is None and shutil.which("python3") is not None:
             argv[0] = "python3"
             head = "python3"
+
+        # Python console scripts are frequently installed as importable modules
+        # without a matching executable on PATH — `pytest` is the common case,
+        # and it is exactly the command the verification gate wants to run.
+        # Rewrite to `python -m <name>`, which works wherever the package is
+        # importable at all.
+        if head in _PYTHON_MODULE_SCRIPTS and shutil.which(head) is None:
+            interpreter = shutil.which("python") and "python" or (
+                shutil.which("python3") and "python3")
+            if interpreter:
+                argv = [interpreter, "-m", head, *argv[1:]]
+                head = interpreter
+
+        # On Windows a .CMD/.BAT shim (npm, npx, and most node tooling) is not a
+        # real executable: CreateProcess cannot start it, so `shell=False` fails
+        # with WinError 193. Route those through the command interpreter, which
+        # is the only way to run them without re-enabling shell parsing for
+        # everything else.
+        resolved_head = shutil.which(head) if head else None
+        if (os.name == "nt" and resolved_head
+                and resolved_head.lower().endswith((".cmd", ".bat"))):
+            comspec = self.env.get("COMSPEC") or os.environ.get(
+                "COMSPEC", r"C:\Windows\System32\cmd.exe")
+            argv = [comspec, "/c", resolved_head, *argv[1:]]
 
         # Emulate ls / dir on Windows if not in PATH
         if head in ("ls", "dir") and shutil.which(head) is None:
@@ -813,6 +987,68 @@ class RepetitionDetector:
         return None
 
 
+class RedundantCallDetector:
+    """
+    The same call repeated across the whole run, not just back to back.
+
+    `RepetitionDetector` only looks at a sliding window, so an agent that reads
+    A, B, C, A, B, C never trips it — every window holds three distinct calls.
+    A real run spent all twelve iterations re-reading four files it had already
+    read, wrote nothing, and hit the iteration cap with no guardrail firing:
+    every step succeeded, so the error detectors stayed quiet too.
+
+    Re-reading a file the run has already read returns the same bytes. Charging
+    an iteration for it is pure waste, and it is the signature of an agent that
+    has lost the thread.
+    """
+    code = "REDUNDANT_REPEATED_CALL"
+
+    def __init__(self, warn_at: int = 2, suspend_at: int = 3) -> None:
+        self.warn_at = warn_at
+        self.suspend_at = suspend_at
+
+    def _code_for(self, step: StepRecord) -> str:
+        """
+        Scope the warning code to the offending call.
+
+        `GuardrailStack` escalates the *second* warning carrying the same code
+        straight to SUSPEND. With one shared code, two unrelated repeats — a
+        re-listed directory here, a re-read file there — looked identical to an
+        agent spinning on one call, and killed the run. A run that re-listed a
+        directory after a failed read (reasonable verification) was suspended on
+        its ninth step having written nothing.
+
+        Per-call codes keep the escalation where it belongs: repeat one specific
+        call and it escalates; make two different mistakes once each and you get
+        two warnings and a chance to act on them.
+        """
+        return f"{self.code}:{step.fingerprint[:8]}"
+
+    def observe(self, steps: Sequence[StepRecord]) -> Verdict | None:
+        if len(steps) < 2:
+            return None
+        latest = steps[-1].fingerprint
+        # Back-to-back repetition belongs to `RepetitionDetector`, and the
+        # iteration budget already bounds a loop that spins on one call. This
+        # detector exists only for the gap neither can see: the same call
+        # returning *after* other calls, which no sliding window catches.
+        if steps[-2].fingerprint == latest:
+            return None
+        seen = sum(1 for s in steps if s.fingerprint == latest)
+        if seen >= self.suspend_at:
+            return Verdict(GuardAction.SUSPEND, self._code_for(steps[-1]),
+                           f"The same call has now been issued {seen} times "
+                           f"({describe_call(steps[-1].call)}). Its result cannot "
+                           "change; the run is not progressing.")
+        if seen >= self.warn_at:
+            return Verdict(GuardAction.WARN, self._code_for(steps[-1]),
+                           f"You already made this exact call earlier "
+                           f"({describe_call(steps[-1].call)}) and received the same "
+                           "result. Use what you have and take an action that "
+                           "changes something.")
+        return None
+
+
 class OscillationDetector:
     """A -> B -> A -> B with no progress."""
     code = "PING_PONG_OSCILLATION"
@@ -881,6 +1117,7 @@ class GuardrailStack:
     def __init__(self, detectors: Sequence[Detector] | None = None) -> None:
         self.detectors: list[Detector] = list(detectors) if detectors is not None else [
             RepetitionDetector(3),
+            RedundantCallDetector(warn_at=2, suspend_at=3),
             OscillationDetector(4),
             NoProgressDetector(3),
             ConsecutiveErrorDetector(3),
@@ -1126,6 +1363,18 @@ class PolicyContext:
     warnings: Sequence[str]
     resume: ResumePayload | None
     workspace: Path
+    #: Actions taken and the cap for this scope. The agent could not see either,
+    #: so it had no reason to stop gathering information — one run spent all nine
+    #: of its steps exploring and never wrote the file it was asked for. Optional
+    #: so existing callers keep working.
+    iterations_used: int | None = None
+    iterations_max: int | None = None
+
+    @property
+    def iterations_left(self) -> int | None:
+        if self.iterations_used is None or self.iterations_max is None:
+            return None
+        return max(0, self.iterations_max - self.iterations_used)
 
 
 def render_observation(result: ToolResult) -> str:
@@ -1251,7 +1500,7 @@ class LLMPolicy:
       2. Token/cost accounting is charged to the ledger on every call, so budget
          guardrails see model spend, not just tool calls.
 
-    `client` must satisfy the `ModelClient` contract in `llm_backends.py`:
+    `client` must satisfy the `ModelClient` contract in `omni.backends`:
     `async complete(system, user, *, schema=None, max_tokens=...) -> Completion`.
     Passing `schema` turns "please reply with JSON" into constrained decoding on
     every local backend, which is what actually removes parse failures.
@@ -1274,18 +1523,71 @@ class LLMPolicy:
 
     def __init__(self, client: Any, ledger: Ledger,
                  schema: dict[str, Any] | None = None,
-                 max_tokens: int = 512) -> None:
+                 max_tokens: int = 512,
+                 recent_observations: int = 6) -> None:
         self.client = client
         self.ledger = ledger
         self.schema = schema
         self.max_tokens = max_tokens
+        # How many steps keep their full observation in the prompt. Everything
+        # older is still listed by `_render`, just without its output.
+        self.recent_observations = recent_observations
+
+    #: Below this many remaining iterations the prompt stops being neutral and
+    #: tells the agent to deliver with what it already has.
+    URGENT_AT = 4
+
+    def _budget_lines(self, ctx: PolicyContext) -> list[str]:
+        """
+        Tell the agent how much rope it has left.
+
+        Without this the loop is open-ended from the agent's point of view: it
+        explores until an iteration cap it cannot see cuts it off mid-thought,
+        having produced nothing. Naming the remaining budget — and, near the end,
+        insisting on a deliverable — converts a silent cutoff into a deadline the
+        agent can plan against.
+        """
+        left = ctx.iterations_left
+        if left is None:
+            return []
+        lines = [f"BUDGET: action {ctx.iterations_used + 1} of {ctx.iterations_max}."]
+        if left <= 1:
+            lines.append(
+                "THIS IS YOUR LAST ACTION. Produce the deliverable now, or finish "
+                "with succeeded=false. Another read accomplishes nothing.")
+        elif left <= self.URGENT_AT:
+            lines.append(
+                f"Only {left} actions remain. Stop gathering information and "
+                "produce the deliverable with what you already know — a run that "
+                "explores until the cap delivers nothing at all.")
+        return lines
 
     def _render(self, ctx: PolicyContext) -> str:
         lines = [f"GOAL: {ctx.goal}", f"PHASE: {ctx.phase}"]
+        lines.extend(self._budget_lines(ctx))
         if ctx.resume is not None:
             lines.append("PRIOR ATTEMPTS (compressed):")
             lines.append(canonical(ctx.resume.model_dump(exclude={"spans"})))
-        for step in ctx.steps[-4:]:
+
+        window = self.recent_observations
+        recent = list(ctx.steps[-window:]) if window else []
+        earlier = list(ctx.steps[:-window]) if len(ctx.steps) > window else []
+
+        # Only the last few observations fit in the prompt, but an action whose
+        # observation has scrolled out is still an action that was taken. Without
+        # this ledger the agent has no record of it and simply does it again: a
+        # real run read index.html and calculator.js, watched them fall out of
+        # the window, and read both again — eleven steps, no writes, suspended by
+        # the repetition guardrail. One line per step is cheap; forgetting is not.
+        if earlier:
+            lines.append("\nALREADY DONE — these calls were made and their results "
+                         "are known. Do not repeat them; re-issuing one returns the "
+                         "same bytes and wastes an iteration:")
+            for step in earlier:
+                status = "ok" if step.result.ok else f"exit {step.result.exit_code}"
+                lines.append(f"  [{step.idx}] {describe_call(step.call)} -> {status}")
+
+        for step in recent:
             lines.append(f"\n[{step.idx}] THOUGHT: {step.thought}")
             lines.append(f"[{step.idx}] ACTION: {step.call.args}")
             lines.append(render_observation(step.result))
@@ -1312,10 +1614,28 @@ class LLMPolicy:
             except (ValueError, ValidationError, json.JSONDecodeError) as exc:
                 if attempt == 1:
                     log.warning("policy output unparseable after repair: %s", exc)
+                    if output_truncated(completion):
+                        return AskHuman(question=(
+                            "My reply was cut off at the token limit before it "
+                            "was complete — most likely because I tried to put a "
+                            "whole file into the action. Ask me to use "
+                            "generate_file, or raise the policy token budget."))
                     return AskHuman(question="I could not produce a valid next action. "
                                              "Please supply the next command.")
                 # Append, never prepend: keeps the cached prefix valid.
-                user = f"{user}\n\nYour previous reply was invalid: {exc}\nReturn valid JSON only."
+                if output_truncated(completion):
+                    # Telling a model its truncated reply was "invalid JSON" is
+                    # actively misleading: the JSON was fine, there was just
+                    # more of it. It retries the same oversized action and is
+                    # cut off in the same place. Name the real cause instead.
+                    user = (f"{user}\n\nYour previous reply was CUT OFF at the token "
+                            "limit, not malformed — it was too long to finish. Do not "
+                            "repeat it. If you were writing file contents inline, use "
+                            "generate_file with a short 'spec' instead, which produces "
+                            "the content in a separate step.")
+                else:
+                    user = (f"{user}\n\nYour previous reply was invalid: {exc}\n"
+                            "Return valid JSON only.")
         return AskHuman(question="Policy exhausted repair attempts.")
 
     @staticmethod
@@ -1364,7 +1684,7 @@ class RepairLoop:
     def __init__(self, *, executor: ToolExecutor, policy: Policy,
                  command_policy: CommandPolicy, journal: RunJournal,
                  workspace: Path, guardrails: GuardrailStack | None = None,
-                 tool_timeout_s: float = 60.0) -> None:
+                 tool_timeout_s: float = 60.0, tool_policy: Any = None) -> None:
         self.executor = executor
         self.policy = policy
         self.command_policy = command_policy
@@ -1372,6 +1692,7 @@ class RepairLoop:
         self.workspace = workspace
         self.guardrails = guardrails or GuardrailStack()
         self.tool_timeout_s = tool_timeout_s
+        self.tool_policy = tool_policy
 
     async def run(self, *, goal: str, ledger: Ledger,
                   resume: ResumePayload | None = None,
@@ -1387,7 +1708,9 @@ class RepairLoop:
 
             ctx = PolicyContext(goal=goal, phase=phase, steps=steps,
                                 warnings=self.guardrails.drain_warnings(),
-                                resume=resume, workspace=self.workspace)
+                                resume=resume, workspace=self.workspace,
+                                iterations_used=ledger.iterations,
+                                iterations_max=ledger.budget.max_iterations)
             decision = await self.policy.propose(ctx)
 
             if isinstance(decision, Finish):
@@ -1399,9 +1722,10 @@ class RepairLoop:
                 return LoopOutcome(False, StopReason.POLICY_ASKED_HUMAN, steps,
                                    decision.question, question=decision)
 
-            command = str(decision.call.args.get("command", ""))
-            verdict = self.command_policy.classify(command)
-            self.journal.emit("tool.policy", command=command, risk=verdict.risk.value,
+            command, verdict, is_shell = classify_call(
+                decision.call, self.command_policy, self.tool_policy)
+            self.journal.emit("tool.policy", command=command, tool=decision.call.tool,
+                              risk=verdict.risk.value,
                               reason=verdict.reason, violations=list(verdict.violations))
 
             if verdict.risk is Risk.FORBIDDEN:
@@ -1418,25 +1742,35 @@ class RepairLoop:
                                        "repeated policy violations")
                 continue
 
-            if verdict.risk is Risk.ELEVATED and "sudo" not in approvals:
+            if verdict.risk is Risk.ELEVATED and not approval_grants(verdict, approvals):
                 return LoopOutcome(False, StopReason.APPROVAL_REQUIRED, steps,
                                    f"`{command}` requires operator approval "
                                    f"({verdict.reason})", pending_command=command)
+
+            # Hand the executor the argv the policy already validated, rather
+            # than letting it re-split the raw string independently. Two parses
+            # of the same text with nothing enforcing agreement is a parser
+            # differential; `command` stays in args for the journal and for
+            # ToolCall.fingerprint, which the guardrail detectors hash.
+            call = (decision.call.model_copy(
+                        update={"args": {**decision.call.args,
+                                         "argv": list(verdict.argv)}})
+                    if is_shell else decision.call)
 
             ledger.tick()
             say(f"[{len(steps) + 1}] 💭 {decision.thought}", indent=2)
             say(f"    🛠️  {command}", indent=2)
             try:
                 result = await asyncio.wait_for(
-                    self.executor.execute(decision.call, self.tool_timeout_s),
+                    self.executor.execute(call, self.tool_timeout_s),
                     timeout=self.tool_timeout_s + 5,
                 )
             except asyncio.TimeoutError:
-                result = ToolResult(call_id=decision.call.call_id, ok=False, exit_code=124,
+                result = ToolResult(call_id=call.call_id, ok=False, exit_code=124,
                                     output="executor did not return within timeout",
                                     error_class=ErrorClass.TIMEOUT)
 
-            step = StepRecord(len(steps) + 1, decision.thought, decision.call, result)
+            step = StepRecord(len(steps) + 1, decision.thought, call, result)
             steps.append(step)
             self.journal.emit("tool.result", command=command, exit_code=result.exit_code,
                               error_class=result.error_class.value,
@@ -1458,7 +1792,30 @@ class RepairLoop:
 @dataclass(frozen=True)
 class PlanStep:
     title: str
-    command: str
+    command: str = ""
+    tool: str = "shell"
+    args: dict[str, Any] | None = None
+
+    def to_args(self) -> dict[str, Any]:
+        """
+        The `args` payload for this step's `ToolCall`.
+
+        A plan step was historically a shell command string, and most still are.
+        A step naming a non-shell tool carries its arguments in `args` instead,
+        which is what lets a plan write a file — the shell cannot, because
+        `CommandPolicy` bans redirection and `echo` alone cannot create one.
+        """
+        if self.args is not None:
+            return dict(self.args)
+        return {"command": self.command}
+
+    def to_call(self) -> "ToolCall":
+        return ToolCall(tool=self.tool, args=self.to_args())
+
+    @property
+    def label(self) -> str:
+        """Human-readable rendering, used in approval messages and outcomes."""
+        return self.command if self.tool in SHELL_TOOLS else describe_call(self.to_call())
 
 
 class PlannerLoop:
@@ -1472,7 +1829,8 @@ class PlannerLoop:
     def __init__(self, *, executor: ToolExecutor, command_policy: CommandPolicy,
                  journal: RunJournal, workspace: Path,
                  repair_factory: Any, repair_iterations: int = 4,
-                 tool_timeout_s: float = 60.0) -> None:
+                 tool_timeout_s: float = 60.0, tool_policy: Any = None,
+                 is_mutating: Any = None) -> None:
         self.executor = executor
         self.command_policy = command_policy
         self.journal = journal
@@ -1480,6 +1838,19 @@ class PlannerLoop:
         self.repair_factory = repair_factory
         self.repair_iterations = repair_iterations
         self.tool_timeout_s = tool_timeout_s
+        self.tool_policy = tool_policy
+        # Optional `(ToolCall) -> bool`; in practice the tool registry. Without
+        # it every step is treated as consequential, which is the old behaviour.
+        self.is_mutating = is_mutating
+
+    def _is_inspection(self, plan_step: PlanStep) -> bool:
+        """True if this step only looks at things."""
+        if self.is_mutating is None:
+            return False
+        try:
+            return not self.is_mutating(plan_step.to_call())
+        except Exception:                                    # noqa: BLE001
+            return False
 
     async def run(self, *, goal: str, plan: Sequence[PlanStep], ledger: Ledger,
                   resume: ResumePayload | None = None) -> LoopOutcome:
@@ -1493,20 +1864,35 @@ class PlannerLoop:
             outcome_step = await self._execute(plan_step, steps, ledger, resume)
             if outcome_step is None:
                 return LoopOutcome(False, StopReason.APPROVAL_REQUIRED, steps,
-                                   f"`{plan_step.command}` requires approval",
-                                   pending_command=plan_step.command)
+                                   f"`{plan_step.label}` requires approval",
+                                   pending_command=plan_step.label)
             steps.append(outcome_step)
 
             if outcome_step.result.ok:
                 say("    ✅ done", indent=1)
                 continue
 
-            say(f"    ↪️  step failed ({outcome_step.result.error_class.value}) "
-                f"— opening scoped repair", indent=1)
             self.journal.emit("plan.step.failed", step=plan_step.title,
                               error_class=outcome_step.result.error_class.value)
 
-            repair = self.repair_factory(plan_step.command)
+            # A read that fails has still told you something. The planner guesses
+            # at filenames — one plan opened with "inspect package.json" in a
+            # project that has none, the scoped repair could not conjure the file,
+            # and the whole run was abandoned along with the two deliverables an
+            # earlier phase had already produced. Absence is a finding; record it
+            # and move on. Steps that change things still get repaired.
+            if self._is_inspection(plan_step):
+                say(f"    ℹ️  inspection step failed "
+                    f"({outcome_step.result.error_class.value}) — recording the "
+                    f"result and continuing", indent=1)
+                self.journal.emit("plan.step.skipped", step=plan_step.title,
+                                  error_class=outcome_step.result.error_class.value)
+                continue
+
+            say(f"    ↪️  step failed ({outcome_step.result.error_class.value}) "
+                f"— opening scoped repair", indent=1)
+
+            repair = self.repair_factory(plan_step.label)
             scoped = ledger.scoped(f"repair:{plan_step.title}", self.repair_iterations)
             repair_outcome = await repair.run(goal=f"unblock: {plan_step.title}",
                                               ledger=scoped, resume=resume,
@@ -1532,11 +1918,15 @@ class PlannerLoop:
 
     async def _execute(self, plan_step: PlanStep, steps: list[StepRecord],
                        ledger: Ledger, resume: ResumePayload | None) -> StepRecord | None:
-        verdict = self.command_policy.classify(plan_step.command)
+        call = plan_step.to_call()
+        _label, verdict, is_shell = classify_call(
+            call, self.command_policy, self.tool_policy)
         approvals = set(resume.approvals) if resume else set()
-        if verdict.risk is Risk.ELEVATED and "sudo" not in approvals:
+        if verdict.risk is Risk.ELEVATED and not approval_grants(verdict, approvals):
             return None
-        call = ToolCall(tool="shell", args={"command": plan_step.command})
+        if is_shell:
+            call = call.model_copy(
+                update={"args": {**call.args, "argv": list(verdict.argv)}})
         if verdict.risk is Risk.FORBIDDEN:
             return StepRecord(len(steps) + 1, plan_step.title, call,
                               ToolResult(call_id=call.call_id, ok=False, exit_code=126,
@@ -1648,9 +2038,17 @@ class Orchestrator:
                  journal: RunJournal | None = None, budget: Budget | None = None,
                  planner: Any = default_plan,
                  repair_policy_factory: Any = None,
-                 router: Any = None) -> None:
+                 router: Any = None, tool_policy: Any = None,
+                 is_mutating: Any = None) -> None:
         self.executor = executor
         self.workspace = workspace
+        # Optional `(ToolCall) -> PolicyDecision | None`; in practice
+        # `agentkit.ToolRegistry.policy_for`. None keeps the shell-only
+        # behaviour, so every existing caller is unaffected.
+        self.tool_policy = tool_policy
+        #: Optional `(ToolCall) -> bool`, used to tell a step that only inspects
+        #: from one that changes the workspace.
+        self.is_mutating = is_mutating
         self.journal = journal or RunJournal(run_id=new_id("run"),
                                              path=workspace / "run.jsonl")
         self.command_policy = CommandPolicy(workspace)
@@ -1662,6 +2060,33 @@ class Orchestrator:
             lambda command: HeuristicRepairPolicy(command))
         self.state: RunState = self.journal.current_state()
 
+    def _make_repair_policy(self, command: str, ledger: "Ledger") -> Any:
+        """
+        Build a repair policy, handing it the *run* ledger when it will take one.
+
+        An LLM-backed policy must charge the same ledger the loops test with
+        `ledger.exceeded()`, or token and USD budgets are never enforced. The CLI
+        previously built a throwaway `Ledger` inside its policy wrapper, so
+        `Budget(max_tokens=..., max_usd=...)` had no effect at all. Factories
+        that only accept `(command)` keep working unchanged.
+        """
+        factory = self.repair_policy_factory
+        try:
+            params = inspect.signature(factory).parameters
+        except (TypeError, ValueError):
+            params = {}
+        takes_ledger = (
+            len(params) >= 2
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+            or "ledger" in params
+        )
+        if takes_ledger:
+            try:
+                return factory(command, ledger)
+            except TypeError:
+                pass
+        return factory(command)
+
     # -- FSM ----------------------------------------------------------------
 
     def _transition(self, new_state: RunState, **payload: Any) -> None:
@@ -1672,8 +2097,36 @@ class Orchestrator:
 
     # -- entry point --------------------------------------------------------
 
+    def _begin_run(self, resume: "ResumePayload | None" = None) -> None:
+        """
+        Start a fresh run on this Orchestrator if the previous one is over.
+
+        Terminal states are terminal by design: a completed run must not
+        transition again, which is what makes the journal replayable. But the
+        CLI keeps **one** Orchestrator for the whole session — building a new
+        one per turn resets `self.state` to CREATED, so the SUSPENDED -> RESUMING
+        edge never fires and every turn opens a separate run_id.
+
+        Those two facts collided: the second task in a session raised
+        `IllegalTransition: SUCCEEDED -> ROUTING`, and the CLI's catch-all turned
+        it into a one-line error with the run lost. A session is many runs, so a
+        new turn after a finished run gets a new run_id appended to the same
+        journal and a state back at CREATED.
+
+        A suspended run is abandoned the same way when a new prompt arrives with
+        no `resume` payload — the operator declined the approval, or simply
+        typed something else. Only a suspension that is actually being resumed
+        is left in place, because `handle` needs to walk it through RESUMING.
+        """
+        stale = self.state in TERMINAL_STATES or (
+            self.state in SUSPENDED_STATES and resume is None)
+        if stale:
+            self.journal = RunJournal(run_id=new_id("run"), path=self.journal.path)
+            self.state = RunState.CREATED
+
     async def handle(self, user_prompt: str,
                      resume: ResumePayload | None = None) -> RunOutcome:
+        self._begin_run(resume)
         ledger = Ledger(budget=self.budget, label="root")
         say(f"\n=== RUN {self.journal.run_id} :: {user_prompt!r} ===")
 
@@ -1706,15 +2159,33 @@ class Orchestrator:
         if decision.route is Route.REPAIR:
             self._transition(RunState.REPAIRING)
             loop = RepairLoop(executor=self.executor,
-                              policy=self.repair_policy_factory("npm install"),
+                              policy=self._make_repair_policy("npm install", ledger),
                               command_policy=self.command_policy, journal=self.journal,
-                              workspace=self.workspace)
+                              workspace=self.workspace, tool_policy=self.tool_policy)
             outcome = await loop.run(goal=user_prompt, ledger=ledger, resume=resume,
                                      phase="environment_repair")
             collected.extend(outcome.steps)
             if not outcome.succeeded:
                 return self._suspend(user_prompt, outcome, "debugging_environment")
-            say(f"🔄 environment clean ({outcome.detail}) — handing control back to the planner")
+
+            # A successful repair loop means the goal was reached, so the run is
+            # over. `RepairLoop` reports succeeded=True from exactly one place —
+            # the policy returning Finish(succeeded=True), which the verify gate
+            # has already made it prove — and every other exit is a failure. It
+            # is also given the *user's* goal, not "unblock the environment", so
+            # it frequently completes the job outright.
+            #
+            # This branch used to fall through to the planner regardless. One run
+            # wrote js/app.js and README.md here, then planned seven fresh steps,
+            # tripped over a package.json that does not exist, and suspended —
+            # discarding two finished deliverables. Repair as a *prelude* to
+            # planning would need the loop to be given a narrower goal and to
+            # signal "unblocked" separately from "done"; it cannot express that
+            # today, and pretending otherwise cost the user their work.
+            self._transition(RunState.SUCCEEDED, budget=ledger.snapshot())
+            say(f"🏁 goal reached in repair — {ledger.snapshot()}")
+            return RunOutcome(self.journal.run_id, self.state, outcome.detail,
+                              None, collected)
 
         self._transition(RunState.PLANNING)
         plan_raw = self.planner(user_prompt)
@@ -1725,10 +2196,11 @@ class Orchestrator:
         planner_loop = PlannerLoop(
             executor=self.executor, command_policy=self.command_policy,
             journal=self.journal, workspace=self.workspace,
+            tool_policy=self.tool_policy, is_mutating=self.is_mutating,
             repair_factory=lambda command: RepairLoop(
-                executor=self.executor, policy=self.repair_policy_factory(command),
+                executor=self.executor, policy=self._make_repair_policy(command, ledger),
                 command_policy=self.command_policy, journal=self.journal,
-                workspace=self.workspace),
+                workspace=self.workspace, tool_policy=self.tool_policy),
         )
         outcome = await planner_loop.run(goal=user_prompt, plan=plan, ledger=ledger, resume=resume)
         collected.extend(outcome.steps)

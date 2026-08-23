@@ -1,0 +1,27 @@
+# Build / packaging artifacts
+*.egg-info/
+build/
+dist/
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Agent runtime state, not source.
+# `run.jsonl` is the event journal the Orchestrator writes into whatever
+# workspace it is pointed at — which is this repo whenever the workspace prompt
+# is answered with "./". `context/` is the memory store, including embeddings.
+run.jsonl
+context/
+
+# Atomic-write temp files from agentkit.jail.write_text_in, if a write is
+# interrupted between the temp write and the rename.
+*.tmp-*

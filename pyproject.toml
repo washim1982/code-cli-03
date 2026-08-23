@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "omni-cli"
+version = "0.2.0"
+description = "Local-first autonomous developer agent with a tool-calling loop and a verification gate"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "rich>=13.7.0",
+    "questionary>=2.0.1",
+    "pydantic>=2.5.0",
+    "httpx>=0.25.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+omni = "omni.cli:main"
+
+[tool.setuptools]
+# src layout: the package is under src/, so the import path never accidentally
+# resolves to the working directory. Without it, running from the repo root
+# imports the source tree while running from anywhere else imports the installed
+# copy — the two can silently diverge.
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
