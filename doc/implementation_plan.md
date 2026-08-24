@@ -1,5 +1,11 @@
 # Interactive Omni CLI Implementation Plan
 
+> **Historical document — delivered.** This was the plan to build `omni_cli.py`; the open
+> questions in it were answered long ago (rich + questionary were adopted, the entry point is
+> now `src/omni/cli.py`, and the workspace is always prompted for). Superseded by
+> `ENHANCEMENT_PLAN.md`, which tracks the work done since.
+
+
 Provide an interactive CLI application utilizing the existing `agent_runtime.py` and `llm_backends.py`. This application will serve as the frontend for the v2 agent loop architecture, allowing users to effortlessly select workspaces, models, and initiate various types of tasks (chat, project creation, bug fixing, research, guided learning).
 
 ## User Review Required

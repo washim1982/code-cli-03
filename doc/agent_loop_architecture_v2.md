@@ -1,5 +1,13 @@
 # Autonomous Agent Loop Architecture — v2
 
+> **Historical document.** Written 2026-08-13, before the tool layer, the verification gate
+> and the `src/omni/` restructure. Kept for the design reasoning, which still holds. Module
+> names have since changed: `agent_runtime.py` -> `src/omni/runtime.py`,
+> `llm_backends.py` -> `src/omni/backends.py`, `omni_cli.py` -> `src/omni/cli.py`, and path
+> containment moved to `src/omni/pathguard.py`. For the current state see `COMPARISON.md`
+> and `ENHANCEMENT_PLAN.md`.
+
+
 > Supersedes `agent_loop_architecture.md`. The v1 design was directionally right:
 > Sense–Think–Act, Planner/ReAct specialisation, the error-over-creation gating
 > rule, and compressed HITL handoff are all kept. What v1 lacked was the set of

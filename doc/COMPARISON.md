@@ -2,7 +2,7 @@
 
 **Subject:** `src/omni/` — `cli.py`, `runtime.py`, `backends.py`, `pathguard.py`, `agentkit/`
 **Compared against:** Claude Code, Cursor Agent, Aider, OpenHands, Codex
-**First reviewed:** 2026-08-21 · **Updated:** 2026-08-22 (355 tests, 8 live runs)
+**First reviewed:** 2026-08-21 · **Updated:** 2026-08-23 (458 tests, 9 live runs)
 
 ---
 
@@ -250,7 +250,9 @@ Legend: ✅ present and sound · 🟡 present but limited · ❌ absent
 | **Multi-backend** | Ollama / LM Studio / llama.cpp probed at startup, role-based routing | usually 1–2 | ✅ **ahead** |
 | **Memory across sessions** | embedding-ranked recall, degrades honestly when unavailable | project config, memory files | ✅ |
 | **Context assembly** | `survey.collect_digest` — ignore-aware tree, ranked files, char budget | repo map, symbol/import graph | 🟡 no symbol graph |
-| **Output fidelity** | **generation is not grounded in what was read** — see below | generated code cites the files it read | 🟡 **the live gap** |
+| **Output fidelity** | generation grounded in referencing files + siblings; policy prefers `edit_file` on existing files | generated code cites the files it read | ✅ |
+| **UI verification** | static contract checks + headless browser: pages served, loaded and every control clicked | rare; usually left to the project's own tests | ✅ **ahead** |
+| **Visual review** | DOM geometry (clipping, overlap, off-screen, contrast) + a cross-checked vision pass; advisory, never gates | screenshot diffing in some tools | ✅ **ahead** |
 | **Streaming** | none — spinner during long generations | token streaming + interrupt | ❌ |
 | **Sub-agents** | none | parallel isolated-context agents | ❌ |
 
@@ -313,9 +315,15 @@ work; it is also the only one that turns fidelity from a hope into a gate.
 ~~1-4~~ **Done.** Perimeter, tool registry, filesystem tools, verify gate and the wiring fixes
 all shipped and are covered by tests. What remains, in order:
 
-1. **Output fidelity** — ground `generate_file` in the observations the run already holds. The
-   loop is reliable now; the content it produces is the weak link.
-2. **Cross-file consistency verification** — the only thing that stops fidelity being a hope.
+1. ~~**Output fidelity**~~ — **done.** `gather_context` shows the generator the files that
+   reference its target plus the siblings it must call, and the policy prefers `edit_file` for
+   files that already exist. What remains is *verifying* the result, not improving the odds.
+2. ~~**Cross-file consistency verification**~~ — **done.** `omni.webcheck` proves referenced
+   files and ids exist; `omni.webcheck --browser` proves the page loads and its controls
+   click. Both are wired into the verification gate and neither needs a model.
+3. ~~**Deterministic layout checks**~~ — **done.** `omni.visualcheck` measures clipping,
+   overlap, off-screen and contrast, and the vision pass on top is cross-checked against
+   those measurements. Triggered by asking to test the UI.
 3. **Streaming** — the largest perceived-latency win; generations sit behind a spinner for
    5-10 seconds each.
 4. **Symbol-level context assembly** — `survey` reads real source but builds no import graph.

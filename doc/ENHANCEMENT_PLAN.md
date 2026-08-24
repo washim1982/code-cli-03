@@ -19,7 +19,7 @@ where it is actually wrong.
 | **3 — Verify gate** | ✅ **done** | `verify.py`, `gate.py`; claimed success is proved or reported failed |
 | **5 — Repo-aware review** | ✅ **done** | `survey.py`; the reviewer reads real source, not a truncated `ls -R` |
 
-**All phases complete.** Tests: **355 passing** across nine suites.
+**All phases complete.** Tests: **458 passing** across eleven suites.
 
 ### Post-integration fixes from real runs
 
@@ -179,6 +179,118 @@ non-mutating step is journalled as `plan.step.skipped` and the plan continues. F
 *change* things still open a scoped repair, and callers that omit the predicate keep the old
 behaviour.
 
+**Run 9 — the loop was right, the output was wrong.** Run 8 finished the task: it diagnosed the
+missing `js/app.js`, wrote it, and wrote a README. The file was syntactically valid, at the right
+path, with guarded listeners — and it bound to `history-list`, `clear-history` and
+`history-panel`, none of which exist. The real ids were `historyList`, `btnClearHistory` and
+`sidebar`. Four of five bindings missed, so the page rendered and silently did nothing.
+
+This is a different failure class from runs 1-8. Those were all *loop* faults — routing, memory,
+guardrails, budget, lifecycle. This one is **output fidelity**: does the artifact agree with the
+facts the run already established? Every mechanism was green and the deliverable was still wrong.
+
+The cause is the boundary `generate_file` introduced. Content is produced in its own completion
+so a project need not fit in one reply; the cost was that the completion saw only a one-sentence
+spec — not the workspace, not the files the loop had just read. Its `context` parameter existed
+and **nothing in the codebase ever populated it**. The generator was structurally blind.
+
+`gather_context` now assembles the source the new file has to agree with, deterministically and
+in relevance order: files that reference the target, then its siblings, then the target itself if
+it exists, under a character budget. Replayed against the real workspace it supplies
+`index.html`, `js/calculator.js` and `js/history.js` — every id the failing run invented is in
+front of the generator, marked authoritative.
+
+The first version matched on the bare filename stem, so generating `js/app.js` pulled in a
+stylesheet containing `.app-container` and pushed a sibling module out of the budget. Matching is
+now on filename and relative path only.
+
+Also: the policy now prefers `edit_file` over `generate_file` for a file that already exists.
+Regenerating a file the agent has read discards what it learned; editing forces it to quote the
+real text, which the uniqueness check already enforces.
+
+### UI verification — tiers 1 and 2 (2026-08-23)
+
+Grounding raised the odds that generated code matches its neighbours; it could not make it
+certain. A static web project has no test suite, so `VerifyGate` had nothing to run and a
+page that rendered blank still passed. Two verifiers close that, and **neither uses a
+model** — whether a file exists and whether an id is defined are facts.
+
+**Tier 1 — `src/omni/webcheck.py`.** Parses every page with `html.parser` (a regex misses
+attributes split across lines, and a false negative here reports a broken page as verified),
+then checks that referenced assets and local links resolve and that every id reached for by
+`getElementById`/`querySelector('#…')` is defined somewhere. Ids a script *creates* — via
+`.id =` or markup in a template literal — count as defined; flagging those would fail a page
+that works, and a verifier that cries wolf gets switched off.
+
+**Tier 2 — `src/omni/browsercheck.py`.** Serves the workspace on an ephemeral port, loads
+each page in headless Chromium, and clicks every control, collecting console errors,
+uncaught exceptions, failed requests and HTTP errors. Findings are deduplicated — the same
+console error on twenty clicks is one defect. Playwright is an optional extra
+(`omni-cli[browser]`); without it the tier reports itself skipped rather than failing a run.
+
+Both are exposed as one command, `python -m omni.webcheck [--browser]`, so they slot into the
+existing `VerifySpec` contract with **no change to the gate at all** — the gate runs a
+command and reads an exit code, and the command happens to be ours. `detect_verify` selects
+the browser variant when Playwright can actually launch, the static one otherwise.
+
+One thing this required: `PYTHONPATH` was added to `SubprocessShell.ENV_ALLOWLIST`. Without
+it `python -m omni.webcheck` fails with `ModuleNotFoundError` in a development install,
+because the env allowlist stripped it. It is a path list, not a credential.
+
+Run against the live workspace, the pair report:
+
+```
+webcheck: 2 static problem(s) in 2 page(s)
+  missing-asset: js/ui.js does not exist  [script_2.html]
+  dangling-id: #history-toggle is referenced but no element defines it  [js/app.js]
+
+browsercheck: 4 runtime problem(s)
+  http-error: 404 for ui.js  [script_2.html]
+  uncaught-exception: Cannot set properties of null (setting 'textContent')  [script_2.html]
+```
+
+`index.html` and its real dependencies pass both cleanly — confirming the grounding fix
+worked, and that the remaining failures come from a stale artefact of the first truncated
+run. Tier 3 (visual review with a vision model) is specified in `TIER3_VISION_PLAN.md` and
+deliberately not built: measured on this machine, the local vision model produces roughly one
+usable observation per attempt and an equal number of invented ones.
+
+### UI verification — tier 3 (2026-08-23)
+
+Tier 3 asks a question with no definite answer: *does the page look right?* That difference
+drives the design — tiers 1 and 2 produce facts and gate the run; tier 3 produces opinions
+and must not.
+
+**Geometry first.** `src/omni/visualcheck.py` extracts every visible element's box, overflow,
+computed colours and effective background, then measures: text wider than its box with no way
+to scroll, elements outside the viewport horizontally, zero-size controls, controls
+overlapping by more than half, and WCAG contrast below 4.5. All facts, no model. On the live
+calculator this found the operator buttons at contrast 3.07 and `#btnEquals` at 4.32 — real
+accessibility defects that every other tier passed.
+
+**Vision second, and never trusted.** `src/omni/vision.py` auto-detects the first installed
+Ollama model that accepts an image. Two workarounds were needed, both found by measurement:
+`think: false` is mandatory — `gemma4:latest` otherwise returned `response=''` with
+`eval_count=250` and `done_reason='length'`, having spent the whole budget reasoning — and an
+empty reply is treated as a failed call rather than "no defects", which would report a broken
+page as clean. A reply matching *"please provide the image"* is also a failure; the model did
+that once with the image attached.
+
+Every claim is then cross-checked. Named an element that exists → `confirmed`. Contradicted
+by the measurements (claimed low contrast where the ratio is 12.0) → dropped. Neither →
+`plausible`, and labelled as such. On the calculator the model reported *"the search box
+appears to be overlapping"* — there is no search box — and the label is what stopped that
+being presented as a defect.
+
+**Grouping.** Nine operator buttons sharing one CSS rule failed the contrast check nine
+times. That is one defect with nine instances; printing it nine times buries everything else.
+
+**Trigger.** A new `UI_TEST` intent, on both the heuristic fast path and the LLM classifier.
+It requires a UI noun plus a checking verb or a problem word, and rules out prompts opening
+with a creation verb — *"create a page"* and *"check the page"* share a noun and mean
+opposite things. `handle_ui_test` runs all three tiers and reports measured and suggested
+findings in separate tables.
+
 ### Project layout (2026-08-22)
 
 ```
@@ -240,17 +352,27 @@ agentkit/stack.py        build_agent_stack(): one call, returns Orchestrator kwa
 agentkit/survey.py       collect_digest(): ranked repo digest under a character budget
 agentkit/tools/fs.py     read_file, list_dir, search_files, write_file, edit_file
 agentkit/tools/shell.py  run_command — defers to CommandPolicy, perimeter unchanged
-agentkit/tools/codegen.py generate_file — one completion per file, not per plan
+agentkit/tools/codegen.py generate_file + gather_context — one grounded completion per file
+webcheck.py              tier 1 — static contract checks, no model, no browser
+browsercheck.py          tier 2 — serve, load, click; optional Playwright
+visualcheck.py           tier 3 — geometry, screenshots, cross-checked vision claims
+vision.py                local vision client; think:false, empty-reply detection
 
 test_agentkit.py         64   perimeter, wiring, memory
-test_agentkit_tools.py   96   registry, fs tools, dispatch, policy, verify, gate,
-                              output budget, redundant-call guard, golden tasks
-test_omni_cli.py         40   plan steps, planner parsing, plan execution, survey,
-                              approvals, multi-file extraction, project routing
+test_agentkit_tools.py   92   registry, fs tools, dispatch, policy, verify, gate,
+                              output budget, redundancy guard, golden tasks
+test_omni_cli.py         61   plan steps, planner parsing, plan execution, survey,
+                              approvals, extraction, routing, failed inspections
 test_codegen.py          23   generate_file, truncation detection, planner fallback
+test_grounding.py        21   context gathering, generation prompt, edit preference
+test_policy_repair.py    37   repair feedback, action history, budget pressure
+test_session.py          15   multi-run sessions, repair that completes the run
+test_trace.py            18   loop trace rendering
+test_webcheck.py         32   static checks, browser checks, verifier selection
+test_visualcheck.py      50   geometry checks, grouping, vision cross-check, UI_TEST
 test_agent_runtime.py    45   vendored runtime suite (was only in my_agent_project/)
                         ---
-                        268   passing
+                        458   passing
 ```
 
 `agent_runtime.py` — the perimeter/wiring edits (containment loop rewritten, `split_command()`,

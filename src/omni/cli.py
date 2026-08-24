@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import questionary
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -434,6 +435,42 @@ _PROJECT_NOUNS = (
 )
 
 
+_UI_NOUNS = (
+    "ui", "u.i.", "user interface", "interface", "layout", "visual", "visually",
+    "browser", "page", "pages", "screen", "frontend", "front-end", "front end",
+    "styling", "css", "design", "render", "responsive", "accessibility", "a11y",
+)
+
+_UI_CHECK_VERBS = (
+    "test", "check", "verify", "validate", "inspect", "audit", "review",
+    "look at", "try", "run", "debug", "diagnose", "find", "detect",
+)
+
+_UI_PROBLEM_WORDS = ("issue", "problem", "broken", "wrong", "bug", "defect",
+                     "look right", "looks right", "looks off", "misaligned")
+
+#: Creation verbs at the start mean "build me one", not "test the one I have".
+_CREATION_OPENERS = ("write", "create", "build", "make", "generate", "scaffold",
+                     "add", "implement")
+
+
+def is_ui_test_request(prompt_lower: str) -> bool:
+    """
+    True when the user is asking to exercise an existing UI, not build one.
+
+    Requires a UI noun plus either a checking verb or a problem word, and rules
+    out prompts that open with a creation verb — "create a page" and "check the
+    page" share a noun and mean opposite things.
+    """
+    words = prompt_lower.split()
+    if words and words[0].strip(".,") in _CREATION_OPENERS:
+        return False
+    if not any(noun in prompt_lower for noun in _UI_NOUNS):
+        return False
+    return (any(verb in prompt_lower for verb in _UI_CHECK_VERBS)
+            or any(word in prompt_lower for word in _UI_PROBLEM_WORDS))
+
+
 def is_project_request(prompt_lower: str) -> bool:
     """
     True when the prompt asks for something that spans multiple files.
@@ -460,7 +497,13 @@ async def classify_intent(prompt: str, client: llm_backends.ModelClient | None) 
     if any(p_lower.startswith(k) for k in ["what is", "how do i", "how to", "explain", "teach me", "guide me", "i want to learn", "tell me about", "why does"]):
         return "LEARN_OR_CHAT"
 
-    # 2. A multi-file scaffold is an agent task, not a one-shot generation.
+    # 2. Exercising an existing UI is its own mode: serve it, load it, click it,
+    # measure it. Checked before the scaffold rule because "test the page" and
+    # "create a page" share a noun and mean opposite things.
+    if is_ui_test_request(p_lower):
+        return "UI_TEST"
+
+    # 3. A multi-file scaffold is an agent task, not a one-shot generation.
     #
     # "create a javascript project ..." used to reach DIRECT_CODE, which asks
     # the model for one markdown answer and scrapes fenced blocks out of it.
@@ -472,7 +515,7 @@ async def classify_intent(prompt: str, client: llm_backends.ModelClient | None) 
     if is_project_request(p_lower):
         return "EXECUTE_TASK"
 
-    # 3. Fast heuristic checks for direct code generation / writing scripts
+    # 4. Fast heuristic checks for direct code generation / writing scripts
     if any(p_lower.startswith(k) for k in [
         "write ", "create a script", "generate a python", "write a function", "make a script",
         "generate script", "create script", "give me code", "give me a python", "write python",
@@ -480,7 +523,7 @@ async def classify_intent(prompt: str, client: llm_backends.ModelClient | None) 
     ]):
         return "DIRECT_CODE"
 
-    # 3. Fast heuristic checks for repository reviews
+    # 5. Fast heuristic checks for repository reviews
     if any(k in p_lower for k in ["review project", "review the project", "project review", "suggest enhancement", "audit the codebase", "analyze repository", "code review"]):
         return "PROJECT_REVIEW"
 
@@ -494,7 +537,7 @@ async def classify_intent(prompt: str, client: llm_backends.ModelClient | None) 
         "properties": {
             "intent": {
                 "type": "string",
-                "enum": ["LEARN_OR_CHAT", "DIRECT_CODE", "PROJECT_REVIEW", "EXECUTE_TASK"]
+                "enum": ["LEARN_OR_CHAT", "DIRECT_CODE", "PROJECT_REVIEW", "UI_TEST", "EXECUTE_TASK"]
             },
             "rationale": {"type": "string"}
         },
@@ -512,7 +555,7 @@ async def classify_intent(prompt: str, client: llm_backends.ModelClient | None) 
         "  scaffold — and anything requiring shell commands (tests, builds, deploys,\n"
         "  fixing terminal errors).\n"
         "If the answer would need several files, choose EXECUTE_TASK, not DIRECT_CODE.\n"
-        "Return a JSON object: {\"intent\": \"LEARN_OR_CHAT\" | \"DIRECT_CODE\" | \"PROJECT_REVIEW\" | \"EXECUTE_TASK\"}"
+        "Return a JSON object with one of those five intent values."
     )
     
     try:
@@ -598,6 +641,106 @@ async def handle_direct_code(prompt: str, client: llm_backends.ModelClient | Non
         console.print(f"[dim yellow]Could not save file: {exc}[/dim yellow]")
 
     return completion.text
+
+
+def _findings_table(title: str, rows, border: str) -> Table:
+    table = Table(title=title, show_header=True, border_style=border)
+    table.add_column("Kind", style="yellow", width=22)
+    table.add_column("Where", style="cyan", width=18)
+    table.add_column("Detail", style="white", overflow="fold")
+    for row in rows:
+        # Escaped: findings carry CSS selectors and paths, and rich reads
+        # `[browser]` or `[type=submit]` as a style tag and silently eats it.
+        table.add_row(*(escape(str(cell)) for cell in row))
+    return table
+
+
+async def handle_ui_test(prompt: str, workspace: Path, recalled: str = "") -> str:
+    """
+    Exercise the UI in this workspace: read it, run it, look at it.
+
+    Three tiers, in increasing cost and decreasing certainty:
+
+      1. static — do referenced files and ids exist? (no browser, no model)
+      2. runtime — does the page load, and does every control click? (browser)
+      3. visual — is anything clipped, overlapping, off-screen or unreadable?
+         (browser geometry, plus a vision model whose claims are cross-checked)
+
+    Tier 3 is advisory. Its measured findings are facts; its model-sourced ones
+    are labelled `plausible` and never presented as certain, because a local
+    vision model invents defects roughly as often as it finds them.
+    """
+    from omni import visualcheck, webcheck
+
+    summary: list[str] = []
+
+    # -- tier 1 ------------------------------------------------------------- #
+    with console.status("[bold green]Checking references and ids...[/bold green]"):
+        static = await asyncio.to_thread(webcheck.run_checks, workspace)
+    if static:
+        console.print(_findings_table(
+            "Static contract problems",
+            [(f.kind, f.where, f.detail) for f in static], "red"))
+        summary.append(f"{len(static)} static problem(s)")
+    else:
+        console.print("[green]✓[/green] Static: every referenced file and id exists.")
+        summary.append("static clean")
+
+    # -- tier 2 ------------------------------------------------------------- #
+    try:
+        with console.status("[bold green]Loading pages and clicking controls...[/bold green]"):
+            runtime = await asyncio.to_thread(_browser_findings, workspace)
+    except RuntimeError as exc:
+        console.print(f"[yellow]Runtime checks skipped — {escape(str(exc))}[/yellow]")
+        runtime, browser_ok = [], False
+    else:
+        browser_ok = True
+        if runtime:
+            console.print(_findings_table(
+                "Runtime problems in the browser",
+                [(f.kind, f.where, f.detail) for f in runtime], "red"))
+            summary.append(f"{len(runtime)} runtime problem(s)")
+        else:
+            console.print("[green]✓[/green] Runtime: pages load and every control clicks.")
+            summary.append("runtime clean")
+
+    # -- tier 3 ------------------------------------------------------------- #
+    if browser_ok:
+        with console.status("[bold green]Measuring layout and reviewing appearance...[/bold green]"):
+            report = await asyncio.to_thread(visualcheck.check_workspace, workspace)
+        for note in report.notes:
+            console.print(f"[dim]  {escape(note)}[/dim]")
+
+        grouped = visualcheck.group_findings(report.findings)
+        measured = [f for f in grouped if f.confidence == "confirmed"]
+        suggested = [f for f in grouped if f.confidence != "confirmed"]
+
+        if measured:
+            console.print(_findings_table(
+                "Measured visual defects",
+                [(f.kind, f.where, f"{f.detail} {f.selector}".strip())
+                 for f in measured], "red"))
+            summary.append(f"{len(measured)} visual defect(s)")
+        else:
+            console.print("[green]✓[/green] Visual: nothing measurably wrong with the layout.")
+
+        if suggested:
+            console.print(_findings_table(
+                "Suggested by the vision model — unverified, may be wrong",
+                [(f.kind, f.where, f"{f.detail} {f.selector}".strip())
+                 for f in suggested], "yellow"))
+        if report.screenshots:
+            console.print(f"[dim]  screenshots: {report.screenshots[0].parent}[/dim]")
+
+    verdict = "; ".join(summary) or "nothing to check"
+    console.print(Panel(verdict, title="UI test complete", border_style="cyan"))
+    return verdict
+
+
+def _browser_findings(workspace: Path):
+    """Tier 2, in a worker thread. Playwright's sync API cannot run in the loop."""
+    from omni.browsercheck import check_workspace
+    return check_workspace(workspace)
 
 
 async def handle_learn_or_chat(prompt: str, client: llm_backends.ModelClient | None,
@@ -1023,6 +1166,10 @@ async def run_cli() -> None:
                     continue
                 elif intent == "PROJECT_REVIEW":
                     text = await handle_project_review(user_input, client, workspace, shell, recalled)
+                    await remember(store, session_id, intent, user_input, text)
+                    continue
+                elif intent == "UI_TEST":
+                    text = await handle_ui_test(user_input, workspace, recalled)
                     await remember(store, session_id, intent, user_input, text)
                     continue
                 else:

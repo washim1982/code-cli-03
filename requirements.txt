@@ -2,3 +2,8 @@ rich>=13.7.0
 questionary>=2.0.1
 pydantic>=2.5.0
 httpx>=0.25.0
+
+# Optional: runtime UI verification (tiers 2 and 3).
+#   pip install playwright && python -m playwright install chromium
+# Without it the static check still runs and the browser tiers report
+# themselves skipped.

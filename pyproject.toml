@@ -17,6 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Runtime UI verification. Kept optional so the core install stays four pure
+# Python packages; `omni.browsercheck` degrades to "cannot check" without it,
+# and the static contract check in `omni.webcheck` works either way.
+# After installing: python -m playwright install chromium
+browser = ["playwright>=1.40"]
 
 [project.scripts]
 omni = "omni.cli:main"

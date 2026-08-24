@@ -786,6 +786,12 @@ class SubprocessShell:
         # pytest, which is the command the verification gate runs. These are
         # directory paths, not credentials.
         "APPDATA", "LOCALAPPDATA", "XDG_DATA_HOME", "XDG_CACHE_HOME",
+        # Needed for `python -m <our own tooling>` to resolve when the package is
+        # on the path rather than installed — the verifier this agent ships
+        # (`omni.webcheck`) is invoked exactly that way. A path list, not a
+        # credential; it names where to look for code, and the code it names is
+        # already the parent process's own.
+        "PYTHONPATH",
     )
 
     def __init__(self, workspace: Path, env: dict[str, str] | None = None,

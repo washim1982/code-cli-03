@@ -177,6 +177,7 @@ The prompt is classified into one of four modes:
 | **Guided learning** | *"How do I build an agentic loop?"*, *"Explain FSM"* | A structured tutorial. No files touched. |
 | **Direct code** | *"Write a python script to add two numbers"* | One file generated; you confirm the filename before it is saved. |
 | **Project review** | *"Review project and suggest enhancements"* | Reads the real source of the workspace and writes an architectural report. |
+| **UI test** | *"Test the UI"*, *"is the layout broken?"*, *"check accessibility"* | Serves the page, clicks every control, measures the layout. |
 | **Agent task** | *"Create a javascript project…"*, *"Fix the failing tests"* | Plans, writes files, runs commands, verifies. |
 
 Anything spanning more than one file routes to **agent task** — a scaffold cannot be produced
@@ -198,9 +199,14 @@ Seven tools. Reads are free; writes need approval unless you allowed them at sta
 | `edit_file(path, old, new, replace_all?)` | needs approval |
 | `generate_file(path, spec)` | needs approval |
 
-`generate_file` is preferred for substantial files: the plan carries a one-line description and
-the content is produced in its own request, so a large project does not have to fit in a single
-response.
+`generate_file` is preferred for substantial **new** files: the plan carries a one-line
+description and the content is produced in its own request, so a large project does not have to
+fit in a single response. That request is **grounded** — it is shown the files that reference the
+target and the sibling modules it must call, so generated code matches the element ids, exported
+names and signatures that actually exist rather than inventing plausible ones.
+
+To change a file that already exists, `edit_file` is preferred: regenerating a file the agent has
+read throws away what it learned, while editing forces it to quote the real text.
 
 ### Command allowlist
 
@@ -227,8 +233,75 @@ to run a check first, chosen from what is present:
 |---|---|
 | `pytest.ini`, `conftest.py`, `tests/`, or `test_*.py` | `pytest -q` |
 | `package.json` with a `test` script | `npm test` |
+| any `.html` file | `python -m omni.webcheck` (`--browser` when Playwright is present) |
 | any `.py` file | `python -m compileall -q .` |
 | nothing checkable | skipped |
+
+### Testing a UI
+
+Ask to **test the UI** — *"test the ui"*, *"open it in a browser and find issues"*,
+*"is the layout broken?"*, *"check accessibility"* — and the agent runs three tiers over the
+workspace and reports what it finds. Creation requests are excluded: *"create a page"* and
+*"check the page"* share a noun and mean opposite things.
+
+| Tier | What it does | Needs |
+|---|---|---|
+| **1 static** | referenced files and DOM ids exist | nothing |
+| **2 runtime** | pages load, every control clicks, console/network clean | Playwright |
+| **3 visual** | clipped text, off-screen and overlapping controls, zero-size controls, WCAG contrast | Playwright |
+| **3 vision** | appearance review from a screenshot | Playwright + a local vision model |
+
+Tiers 1 and 2 gate a run — they produce facts. **Tier 3 never fails a run.** Its geometry
+findings are measured and reported as such; anything the vision model contributes is
+cross-checked against the geometry, dropped where the measurements contradict it, and shown
+under *"Suggested by the vision model — unverified, may be wrong"* otherwise. A local vision
+model invents defects about as often as it finds them, and a verifier that halts on an
+invented one gets switched off along with the real findings.
+
+Each tier is also a command:
+
+```bash
+python -m omni.visualcheck path/to/project
+```
+
+Add `--no-vision` for geometry only, `--mobile` for a 375x812 viewport, `--json` for machine
+output. Screenshots land in `.omni/screenshots/` inside the workspace.
+
+Vision is auto-detected: the first installed Ollama model that accepts an image is used, and
+`think` is forced off — reasoning models otherwise spend the whole token budget thinking and
+return an empty string. No vision model is a note, not an error.
+
+### Verifying a browser project
+
+A static web project has no test suite, so nothing used to check that generated JavaScript
+agreed with the page it runs in. Two checks now do, and neither needs a model.
+
+**Static** — `python -m omni.webcheck` reads the source and proves what can be proved:
+every `<script src>`, `<link href>` and local `<a href>` resolves to a file that exists, and
+every id a script reaches for via `getElementById` or `querySelector('#…')` is defined in some
+page. Ids a script creates at runtime are recognised, so a working page is not failed.
+
+**Runtime** — `python -m omni.webcheck --browser` additionally serves the workspace over HTTP,
+loads every page in headless Chromium, and clicks every control, collecting console errors,
+uncaught exceptions, failed requests and HTTP errors. Serving over HTTP also avoids the
+`file:` origin restrictions that break `sessionStorage` when a page is opened from disk.
+
+The browser tier is optional:
+
+```bash
+pip install "omni-cli[browser]"
+```
+
+```bash
+python -m playwright install chromium
+```
+
+Without it the static check still runs and the browser step reports itself as skipped. Both
+can be run by hand on any directory:
+
+```bash
+python -m omni.webcheck --browser path/to/project
+```
 
 If the check keeps failing, the run is reported as **failed** rather than succeeded.
 
@@ -240,7 +313,7 @@ If the check keeps failing, the run is reported as **failed** rather than succee
 python -m pytest -q
 ```
 
-311 tests across eight suites. `pytest.ini` sets `pythonpath = src`, so this works from any
+458 tests across eleven suites. `pytest.ini` sets `pythonpath = src`, so this works from any
 directory without installing the package.
 
 ---
